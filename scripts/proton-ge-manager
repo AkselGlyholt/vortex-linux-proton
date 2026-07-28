@@ -1,0 +1,215 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+umask 077
+
+PROGRAM_NAME="vortex proton-ge manager"
+DATA_HOME="${VORTEX_DATA_HOME:-${XDG_DATA_HOME:-${HOME}/.local/share}/vortex-linux}"
+RUNTIME_ROOT="${VORTEX_RUNTIME_ROOT:-${DATA_HOME}/runtimes}"
+CURRENT_LINK="${RUNTIME_ROOT}/current"
+GE_RELEASE_API="${VORTEX_GE_RELEASE_API:-https://api.github.com/repos/GloriousEggroll/proton-ge-custom/releases/latest}"
+DOWNLOAD_TMP_DIR=""
+
+die() {
+    printf '%s: %s\n' "${PROGRAM_NAME}" "$*" >&2
+    exit 1
+}
+
+resolve_proton_path() {
+    local candidate="$1"
+
+    if [[ -d "${candidate}" ]]; then
+        candidate="${candidate}/proton"
+    fi
+
+    [[ -f "${candidate}" && -x "${candidate}" ]] || return 1
+    printf '%s\n' "${candidate}"
+}
+
+find_proton() {
+    local candidate root
+    local -a candidates=()
+    local -a roots=(
+        "${RUNTIME_ROOT}"
+        "${HOME}/.steam/root/compatibilitytools.d"
+        "${HOME}/.local/share/Steam/compatibilitytools.d"
+        "${HOME}/.var/app/com.valvesoftware.Steam/data/Steam/compatibilitytools.d"
+    )
+
+    if [[ -n "${VORTEX_PROTON:-}" ]]; then
+        resolve_proton_path "${VORTEX_PROTON}" ||
+            die "VORTEX_PROTON does not point to an executable Proton script: ${VORTEX_PROTON}"
+        return
+    fi
+
+    if [[ -e "${CURRENT_LINK}" ]] && candidate="$(resolve_proton_path "${CURRENT_LINK}" 2>/dev/null)"; then
+        printf '%s\n' "${candidate}"
+        return
+    fi
+
+    for root in "${roots[@]}"; do
+        [[ -d "${root}" ]] || continue
+        while IFS= read -r candidate; do
+            candidates+=("${candidate}")
+        done < <(
+            find "${root}" -mindepth 2 -maxdepth 2 -type f -name proton \
+                -path '*/GE-Proton*/proton' -perm -u+x -print 2>/dev/null
+        )
+    done
+
+    ((${#candidates[@]} > 0)) || return 1
+    printf '%s\n' "${candidates[@]}" | LC_ALL=C sort -V | tail -n 1
+}
+
+require_download_tools() {
+    local tool
+    for tool in curl tar sha512sum mktemp; do
+        command -v "${tool}" >/dev/null 2>&1 || die "required command is missing: ${tool}"
+    done
+}
+
+cleanup_download() {
+    if [[ -n "${DOWNLOAD_TMP_DIR}" && -d "${DOWNLOAD_TMP_DIR}" ]]; then
+        rm -rf -- "${DOWNLOAD_TMP_DIR}"
+    fi
+}
+
+json_asset_url() {
+    local json="$1"
+    local suffix="$2"
+
+    printf '%s\n' "${json}" |
+        grep -oE '"browser_download_url"[[:space:]]*:[[:space:]]*"[^"]+"' |
+        sed 's/^.*"[[:space:]]*:[[:space:]]*"//; s/"$//' |
+        grep -Ev -- '-aarch64(\.|-)' |
+        grep -E "${suffix}" |
+        head -n 1
+}
+
+fetch_release_json() {
+    curl --fail --silent --show-error --location \
+        --retry 3 --retry-delay 2 \
+        -H 'Accept: application/vnd.github+json' \
+        -H 'User-Agent: vortex-linux-launcher' \
+        "${GE_RELEASE_API}"
+}
+
+release_info() {
+    local release_json tarball_url checksum_url
+
+    require_download_tools
+    release_json="$(fetch_release_json)"
+    tarball_url="$(json_asset_url "${release_json}" '\.tar\.gz$')" ||
+        die "the GE-Proton release did not contain an x86-64 .tar.gz asset"
+    checksum_url="$(json_asset_url "${release_json}" '\.sha512sum$')" ||
+        die "the GE-Proton release did not contain an x86-64 .sha512sum asset"
+    printf 'tarball=%s\nchecksum=%s\n' "${tarball_url}" "${checksum_url}"
+}
+
+install_latest() {
+    local release_json tarball_url checksum_url tarball_name checksum_name
+    local tmp_dir extract_dir proton_file extracted_root release_name destination
+    local tmp_link
+
+    require_download_tools
+    mkdir -p "${RUNTIME_ROOT}"
+    chmod 700 "${RUNTIME_ROOT}"
+
+    printf 'Finding the latest official GE-Proton release...\n'
+    release_json="$(fetch_release_json)"
+
+    tarball_url="$(json_asset_url "${release_json}" '\.tar\.gz$')" ||
+        die "the GE-Proton release did not contain an x86-64 .tar.gz asset"
+    checksum_url="$(json_asset_url "${release_json}" '\.sha512sum$')" ||
+        die "the GE-Proton release did not contain an x86-64 .sha512sum asset"
+
+    [[ "${tarball_url}" == https://github.com/GloriousEggroll/proton-ge-custom/releases/download/* ]] ||
+        die "refusing unexpected GE-Proton download host"
+    [[ "${checksum_url}" == https://github.com/GloriousEggroll/proton-ge-custom/releases/download/* ]] ||
+        die "refusing unexpected GE-Proton checksum host"
+
+    tarball_name="${tarball_url##*/}"
+    checksum_name="${checksum_url##*/}"
+    tmp_dir="$(mktemp -d "${RUNTIME_ROOT}/.download.XXXXXX")"
+    DOWNLOAD_TMP_DIR="${tmp_dir}"
+    trap cleanup_download EXIT
+
+    printf 'Downloading %s...\n' "${tarball_name}"
+    curl --fail --show-error --location \
+        --retry 3 --retry-delay 2 \
+        --output "${tmp_dir}/${tarball_name}" \
+        "${tarball_url}"
+    curl --fail --silent --show-error --location \
+        --retry 3 --retry-delay 2 \
+        --output "${tmp_dir}/${checksum_name}" \
+        "${checksum_url}"
+
+    printf 'Verifying SHA-512 checksum...\n'
+    (
+        cd "${tmp_dir}"
+        sha512sum --check "${checksum_name}"
+    )
+
+    extract_dir="${tmp_dir}/extract"
+    mkdir -p "${extract_dir}"
+    tar --extract --file "${tmp_dir}/${tarball_name}" \
+        --directory "${extract_dir}" --no-same-owner --no-same-permissions
+
+    proton_file="$(
+        find "${extract_dir}" -mindepth 2 -maxdepth 2 -type f -name proton -print -quit
+    )"
+    [[ -n "${proton_file}" ]] || die "downloaded archive does not contain a Proton runtime"
+    extracted_root="${proton_file%/proton}"
+    release_name="${extracted_root##*/}"
+    [[ "${release_name}" == GE-Proton* ]] || die "unexpected runtime directory: ${release_name}"
+    [[ -f "${extracted_root}/compatibilitytool.vdf" ]] ||
+        die "downloaded archive is not a complete GE-Proton distribution"
+    chmod +x "${proton_file}"
+
+    destination="${RUNTIME_ROOT}/${release_name}"
+    if [[ ! -e "${destination}" ]]; then
+        mv "${extracted_root}" "${destination}"
+    fi
+
+    tmp_link="${RUNTIME_ROOT}/.current.$$"
+    ln -s "${release_name}" "${tmp_link}"
+    mv -Tf "${tmp_link}" "${CURRENT_LINK}"
+
+    printf 'GE-Proton ready: %s\n' "${destination}"
+    printf '%s\n' "${destination}/proton"
+}
+
+print_usage() {
+    cat <<'EOF'
+Usage: proton-ge-manager COMMAND
+
+Commands:
+  find       Print the selected GE-Proton executable
+  install    Download, verify, and select the latest official GE-Proton
+  info       Print the selected official release asset URLs
+  help       Show this help
+
+Environment:
+  VORTEX_PROTON       Explicit Proton script or GE-Proton directory
+  VORTEX_DATA_HOME    Override Vortex's Linux data directory
+  VORTEX_RUNTIME_ROOT Override the directory containing GE-Proton releases
+EOF
+}
+
+case "${1:-find}" in
+    find)
+        find_proton
+        ;;
+    install)
+        install_latest
+        ;;
+    info)
+        release_info
+        ;;
+    help | --help | -h)
+        print_usage
+        ;;
+    *)
+        die "unknown command: $1"
+        ;;
+esac

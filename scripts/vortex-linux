@@ -1,0 +1,403 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+umask 077
+
+PROGRAM_NAME="vortex-linux"
+SELF_PATH="$(readlink -f -- "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${SELF_PATH}")" && pwd -P)"
+INSTALL_ROOT="${VORTEX_INSTALL_ROOT:-$(cd -- "${SCRIPT_DIR}/.." && pwd -P)}"
+DATA_HOME="${VORTEX_DATA_HOME:-${XDG_DATA_HOME:-${HOME}/.local/share}/vortex-linux}"
+STATE_HOME="${VORTEX_STATE_HOME:-${XDG_STATE_HOME:-${HOME}/.local/state}/vortex-linux}"
+APP_DIR="${VORTEX_APP_DIR:-${INSTALL_ROOT}/app}"
+VORTEX_EXE="${VORTEX_EXE:-${APP_DIR}/Vortex.exe}"
+PROTON_MANAGER="${VORTEX_PROTON_MANAGER:-${SCRIPT_DIR}/proton-ge-manager}"
+COMPAT_DATA="${VORTEX_COMPAT_DATA:-${DATA_HOME}/compatdata}"
+WINE_PREFIX="${VORTEX_WINEPREFIX:-${DATA_HOME}/wineprefix}"
+LOG_FILE="${VORTEX_LOG_FILE:-${STATE_HOME}/launcher.log}"
+RUNTIME_MODE="${VORTEX_RUNTIME:-auto}"
+FOREGROUND="${VORTEX_FOREGROUND:-0}"
+DISPATCH=0
+URI_FILE=""
+
+die() {
+    printf '%s: %s\n' "${PROGRAM_NAME}" "$*" >&2
+    command -v notify-send >/dev/null 2>&1 &&
+        notify-send --app-name Vortex 'Vortex could not start' "$*" >/dev/null 2>&1 || true
+    exit 1
+}
+
+print_usage() {
+    cat <<'EOF'
+Usage: vortex-linux [OPTIONS] [vortex:URI]
+
+Launch Vortex.exe on Linux with GE-Proton. A Wine fallback is used only when
+GE-Proton is unavailable, or when explicitly requested.
+
+Options:
+  --foreground       Keep the launcher attached and show application output
+  --dispatch         Detach through a transient systemd user service when available
+  --runtime MODE     Select auto, proton, or wine
+  --doctor           Check the installation and protocol handler
+  --install-proton   Download and select the latest official GE-Proton
+  --help             Show this help
+
+The desktop entry passes website launch URLs here as one literal argument.
+Only the vortex: URI scheme is accepted; the URI is never evaluated by a shell.
+EOF
+}
+
+dispatch_to_systemd() {
+    local uri="${1:-}"
+    local name
+    local runtime_dir=""
+    local uri_file=""
+    local -a command=(
+        systemd-run
+        --user
+        --collect
+        --quiet
+        --property=Type=exec
+    )
+
+    command -v systemd-run >/dev/null 2>&1 || return 1
+
+    if [[ -n "${uri}" ]]; then
+        runtime_dir="${XDG_RUNTIME_DIR:-${STATE_HOME}}/vortex-linux"
+        mkdir -p "${runtime_dir}"
+        chmod 700 "${runtime_dir}"
+        uri_file="$(mktemp "${runtime_dir}/launch-uri.XXXXXX")"
+        printf '%s' "${uri}" >"${uri_file}"
+    fi
+
+    # A transient user service survives the browser/portal launch scope. Carry
+    # across the graphical-session variables that may not be in user manager's
+    # environment on all desktops.
+    for name in \
+        DISPLAY WAYLAND_DISPLAY XDG_RUNTIME_DIR XAUTHORITY \
+        DBUS_SESSION_BUS_ADDRESS PULSE_SERVER PIPEWIRE_REMOTE; do
+        if [[ -v "${name}" ]]; then
+            command+=("--setenv=${name}=${!name}")
+        fi
+    done
+
+    command+=(-- "${SCRIPT_DIR}/vortex-linux")
+    [[ -z "${uri_file}" ]] || command+=(--uri-file "${uri_file}")
+    if ! "${command[@]}"; then
+        [[ -z "${uri_file}" ]] || rm -f -- "${uri_file}"
+        return 1
+    fi
+}
+
+read_uri_file() {
+    local path="$1"
+    local owner=""
+    local mode=""
+    local value=""
+
+    [[ "${path}" == /* && -f "${path}" && ! -L "${path}" ]] ||
+        die "the internal launch URL file is invalid"
+    owner="$(stat -c '%u' -- "${path}" 2>/dev/null || true)"
+    mode="$(stat -c '%a' -- "${path}" 2>/dev/null || true)"
+    [[ "${owner}" == "$(id -u)" && "${mode}" =~ ^[46]00$ ]] ||
+        die "the internal launch URL file is not private"
+
+    value="$(<"${path}")"
+    rm -f -- "${path}"
+    printf '%s' "${value}"
+}
+
+valid_uri() {
+    local uri="$1"
+    local scheme
+
+    ((${#uri} <= 16384)) || return 1
+    # Bash arguments cannot contain NUL bytes. Reject the remaining line-control
+    # characters that should never occur in a browser protocol handoff.
+    [[ "${uri}" != *$'\n'* && "${uri}" != *$'\r'* ]] || return 1
+    [[ "${uri}" == *:* ]] || return 1
+    scheme="${uri%%:*}"
+    [[ "${scheme,,}" == vortex ]]
+}
+
+detect_steam_root() {
+    local candidate
+
+    if [[ -n "${VORTEX_STEAM_ROOT:-}" ]]; then
+        printf '%s\n' "${VORTEX_STEAM_ROOT}"
+        return
+    fi
+
+    for candidate in \
+        "${HOME}/.steam/root" \
+        "${HOME}/.local/share/Steam" \
+        "${HOME}/.var/app/com.valvesoftware.Steam/data/Steam"; do
+        if [[ -d "${candidate}" ]]; then
+            printf '%s\n' "${candidate}"
+            return
+        fi
+    done
+
+    # Proton requires this variable even when invoked outside the Steam client.
+    printf '%s\n' "${DATA_HOME}/steam-client"
+}
+
+find_proton() {
+    [[ -x "${PROTON_MANAGER}" ]] || return 1
+    "${PROTON_MANAGER}" find 2>/dev/null
+}
+
+find_wine() {
+    local wine="${VORTEX_WINE:-wine}"
+
+    if [[ "${wine}" == */* ]]; then
+        [[ -x "${wine}" ]] || return 1
+        printf '%s\n' "${wine}"
+    else
+        command -v "${wine}" 2>/dev/null
+    fi
+}
+
+rotate_log() {
+    local size=0
+
+    mkdir -p "${STATE_HOME}"
+    chmod 700 "${STATE_HOME}"
+    if [[ -f "${LOG_FILE}" ]]; then
+        size="$(stat -c '%s' "${LOG_FILE}" 2>/dev/null || printf '0')"
+        if ((size > 5242880)); then
+            mv -f "${LOG_FILE}" "${LOG_FILE}.1"
+        fi
+    fi
+}
+
+launch_proton() {
+    local proton="$1"
+    local uri="${2:-}"
+    local steam_root
+    local prefix_was_uninitialized=0
+    local status=0
+    local -a command=("${proton}" run "${VORTEX_EXE}")
+
+    [[ -z "${uri}" ]] || command+=("${uri}")
+    steam_root="$(detect_steam_root)"
+    mkdir -p "${COMPAT_DATA}" "${steam_root}"
+    [[ -f "${COMPAT_DATA}/version" ]] || prefix_was_uninitialized=1
+
+    export STEAM_COMPAT_CLIENT_INSTALL_PATH="${steam_root}"
+    export STEAM_COMPAT_DATA_PATH="${COMPAT_DATA}"
+    export STEAM_COMPAT_INSTALL_PATH="${APP_DIR}"
+    export SteamAppId="${SteamAppId:-0}"
+    export SteamGameId="${SteamGameId:-0}"
+    # Wine's Windows.Gaming.Input implementation does not provide
+    # RawGameController.NonRoamableId. Vortex's gilrs-core 0.6.7 build unwraps
+    # that call and crashes when a HID interface looks like a joystick. GE-
+    # Proton's supported hidraw switch avoids that path and still permits its
+    # SDL input backend. Respect an explicit caller override.
+    export PROTON_DISABLE_HIDRAW="${PROTON_DISABLE_HIDRAW:-1}"
+
+    if [[ "${FOREGROUND}" == 1 ]]; then
+        set +e
+        "${command[@]}"
+        status=$?
+        if ((status == 101 && prefix_was_uninitialized == 1)); then
+            printf '%s: Proton initialized its prefix; retrying Vortex once.\n' "${PROGRAM_NAME}" >&2
+            "${command[@]}"
+            status=$?
+        fi
+        exit "${status}"
+    fi
+
+    rotate_log
+    # Keep this launcher process alive until Proton exits. Desktop launchers may
+    # run us in a transient systemd scope whose remaining child processes are
+    # killed as soon as the Exec= process returns, even if nohup/disown was used.
+    (
+        trap '' HUP
+        set +e
+        printf '[%s] Starting Vortex with GE-Proton (URI: %s)\n' \
+            "$(date --iso-8601=seconds)" "$([[ -n "${uri}" ]] && printf 'yes' || printf 'no')"
+        "${command[@]}"
+        status=$?
+        if ((status == 101 && prefix_was_uninitialized == 1)); then
+            printf '[%s] Proton initialized its prefix; retrying Vortex once\n' \
+                "$(date --iso-8601=seconds)"
+            "${command[@]}"
+            status=$?
+        fi
+        printf '[%s] Vortex/GE-Proton exited with status %d\n' \
+            "$(date --iso-8601=seconds)" "${status}"
+    ) >>"${LOG_FILE}" 2>&1 </dev/null
+}
+
+launch_wine() {
+    local wine="$1"
+    local uri="${2:-}"
+    local status=0
+    local -a command=("${wine}" "${VORTEX_EXE}")
+
+    [[ -z "${uri}" ]] || command+=("${uri}")
+    mkdir -p "${WINE_PREFIX}"
+    export WINEPREFIX="${WINE_PREFIX}"
+
+    if [[ "${FOREGROUND}" == 1 ]]; then
+        "${command[@]}"
+        exit $?
+    fi
+
+    rotate_log
+    # See launch_proton: the desktop Exec= process must outlive its runtime.
+    (
+        trap '' HUP
+        set +e
+        printf '[%s] GE-Proton unavailable; starting Vortex with Wine (URI: %s)\n' \
+            "$(date --iso-8601=seconds)" "$([[ -n "${uri}" ]] && printf 'yes' || printf 'no')"
+        "${command[@]}"
+        status=$?
+        printf '[%s] Vortex/Wine exited with status %d\n' \
+            "$(date --iso-8601=seconds)" "${status}"
+    ) >>"${LOG_FILE}" 2>&1 </dev/null
+}
+
+doctor() {
+    local failed=0
+    local proton=""
+    local wine=""
+    local handler=""
+
+    printf 'Vortex Linux diagnostics\n'
+    printf '  Architecture:     %s\n' "$(uname -m)"
+    printf '  Executable:       %s' "${VORTEX_EXE}"
+    if [[ -f "${VORTEX_EXE}" ]]; then
+        printf ' (ok)\n'
+    else
+        printf ' (missing)\n'
+        failed=1
+    fi
+
+    proton="$(find_proton || true)"
+    if [[ -n "${proton}" ]]; then
+        printf '  GE-Proton:        %s\n' "${proton}"
+    else
+        printf '  GE-Proton:        not found\n'
+    fi
+
+    wine="$(find_wine || true)"
+    printf '  Wine fallback:    %s\n' "${wine:-not found}"
+    if [[ -z "${proton}" && -z "${wine}" ]]; then
+        failed=1
+    fi
+
+    if command -v xdg-mime >/dev/null 2>&1; then
+        handler="$(xdg-mime query default x-scheme-handler/vortex 2>/dev/null || true)"
+    fi
+    printf '  vortex: handler:  %s\n' "${handler:-not registered}"
+    [[ "${handler}" == io.playvortex.Vortex.desktop ]] || failed=1
+
+    printf '  Proton prefix:    %s\n' "${COMPAT_DATA}"
+    printf '  Launcher log:     %s\n' "${LOG_FILE}"
+    if command -v vulkaninfo >/dev/null 2>&1; then
+        printf '  Vulkan tools:     available\n'
+    else
+        printf '  Vulkan tools:     not installed (optional diagnostic tool)\n'
+    fi
+
+    return "${failed}"
+}
+
+uri=""
+while (($# > 0)); do
+    case "$1" in
+        --foreground)
+            FOREGROUND=1
+            shift
+            ;;
+        --dispatch)
+            DISPATCH=1
+            shift
+            ;;
+        --uri-file)
+            (($# >= 2)) || die "--uri-file requires a path"
+            [[ -z "${URI_FILE}" ]] || die "--uri-file may only be supplied once"
+            URI_FILE="$2"
+            shift 2
+            ;;
+        --runtime)
+            (($# >= 2)) || die "--runtime requires auto, proton, or wine"
+            RUNTIME_MODE="$2"
+            shift 2
+            ;;
+        --doctor)
+            doctor
+            exit
+            ;;
+        --install-proton)
+            [[ -x "${PROTON_MANAGER}" ]] || die "Proton manager is missing"
+            "${PROTON_MANAGER}" install
+            exit
+            ;;
+        --help | -h)
+            print_usage
+            exit
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            die "unknown option: $1"
+            ;;
+        *)
+            [[ -z "${uri}" ]] || die "only one vortex: URI may be supplied"
+            uri="$1"
+            shift
+            ;;
+    esac
+done
+
+if (($# > 0)); then
+    [[ -z "${uri}" && $# == 1 ]] || die "only one vortex: URI may be supplied"
+    uri="$1"
+fi
+
+if [[ -n "${URI_FILE}" ]]; then
+    [[ -z "${uri}" ]] || die "a launch URL and --uri-file cannot be combined"
+    uri="$(read_uri_file "${URI_FILE}")"
+fi
+
+[[ -z "${uri}" ]] || valid_uri "${uri}" || die "refusing a non-vortex or malformed URI"
+[[ -f "${VORTEX_EXE}" ]] || die "Vortex.exe is missing: ${VORTEX_EXE}"
+[[ "$(uname -m)" == x86_64 ]] ||
+    die "Vortex.exe is x86-64; this launcher currently requires x86_64 Linux"
+
+if ((DISPATCH == 1)); then
+    if dispatch_to_systemd "${uri}"; then
+        exit 0
+    fi
+    printf '%s: systemd user dispatch failed; using the direct launch path.\n' \
+        "${PROGRAM_NAME}" >&2
+fi
+
+case "${RUNTIME_MODE}" in
+    auto)
+        if proton="$(find_proton)"; then
+            launch_proton "${proton}" "${uri}"
+        elif wine="$(find_wine)"; then
+            launch_wine "${wine}" "${uri}"
+        else
+            die "neither GE-Proton nor Wine is installed; run with --install-proton"
+        fi
+        ;;
+    proton)
+        proton="$(find_proton)" ||
+            die "GE-Proton is unavailable; run with --install-proton"
+        launch_proton "${proton}" "${uri}"
+        ;;
+    wine)
+        wine="$(find_wine)" || die "Wine is unavailable"
+        launch_wine "${wine}" "${uri}"
+        ;;
+    *)
+        die "invalid runtime '${RUNTIME_MODE}'; expected auto, proton, or wine"
+        ;;
+esac

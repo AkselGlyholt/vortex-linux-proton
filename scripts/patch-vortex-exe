@@ -1,0 +1,217 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+PROGRAM_NAME="patch-vortex-exe"
+ORIGINAL_CONTEXT="3c010f8561040000"
+PATCHED_CONTEXT="3c010f8761040000"
+BUILD_VERSION=""
+FILE_STATE=""
+ORIGINAL_SHA256=""
+PATCHED_SHA256=""
+CONTEXT_OFFSET=0
+PATCH_OFFSET=0
+
+die() {
+    printf '%s: %s\n' "${PROGRAM_NAME}" "$*" >&2
+    exit 1
+}
+
+usage() {
+    cat <<'EOF'
+Usage: patch-vortex-exe [--check | --restore] PATH
+
+Apply or inspect a supported Vortex swap-chain timeout recovery patch.
+
+The patch changes one x86-64 conditional jump in Bevy's prepare_windows:
+SurfaceError::Timeout and SurfaceError::Outdated both reconfigure/retry the
+surface, while Lost and OutOfMemory retain their original fatal behavior.
+
+Options:
+  --check       Report whether PATH is original, patched, or unsupported
+  --restore     Restore PATH from PATH.unpatched
+  --help        Show this help
+EOF
+}
+
+hash_file() {
+    sha256sum -- "$1" | cut -d' ' -f1
+}
+
+read_context() {
+    local target="$1"
+    local offset="$2"
+
+    dd if="${target}" bs=1 skip="${offset}" count=8 status=none |
+        od -An -tx1 -v |
+        tr -d ' \n'
+}
+
+load_file() {
+    local target="$1"
+    local context
+
+    [[ -f "${target}" ]] || die "file not found: ${target}"
+    file_hash="$(hash_file "${target}")"
+    case "${file_hash}" in
+        891b5761c89dfb8a6a8b6ce4518027cb34f7085e95bb992688c2b0ff8577e98a)
+            BUILD_VERSION="0.2.16"
+            FILE_STATE="original"
+            ORIGINAL_SHA256="${file_hash}"
+            PATCHED_SHA256="cf51f708f85d879182cf601036e1f7fd87a4d6bc8bd0e96d8c4976e3afad84e6"
+            CONTEXT_OFFSET=36631456
+            PATCH_OFFSET=36631459
+            ;;
+        cf51f708f85d879182cf601036e1f7fd87a4d6bc8bd0e96d8c4976e3afad84e6)
+            BUILD_VERSION="0.2.16"
+            FILE_STATE="patched"
+            ORIGINAL_SHA256="891b5761c89dfb8a6a8b6ce4518027cb34f7085e95bb992688c2b0ff8577e98a"
+            PATCHED_SHA256="${file_hash}"
+            CONTEXT_OFFSET=36631456
+            PATCH_OFFSET=36631459
+            ;;
+        1b8edf5d3fb8fdddbc653d6f35c88ce66c44eb8c243cbedef7b6512ec9c79082)
+            BUILD_VERSION="0.2.13"
+            FILE_STATE="original"
+            ORIGINAL_SHA256="${file_hash}"
+            PATCHED_SHA256="a086ef6226cd11860ced2750ba038077e48c101489bb3999a4c48d13447884c7"
+            CONTEXT_OFFSET=36596320
+            PATCH_OFFSET=36596323
+            ;;
+        a086ef6226cd11860ced2750ba038077e48c101489bb3999a4c48d13447884c7)
+            BUILD_VERSION="0.2.13"
+            FILE_STATE="patched"
+            ORIGINAL_SHA256="1b8edf5d3fb8fdddbc653d6f35c88ce66c44eb8c243cbedef7b6512ec9c79082"
+            PATCHED_SHA256="${file_hash}"
+            CONTEXT_OFFSET=36596320
+            PATCH_OFFSET=36596323
+            ;;
+        *)
+            FILE_STATE="unsupported"
+            return 1
+            ;;
+    esac
+
+    context="$(read_context "${target}" "${CONTEXT_OFFSET}")"
+    if [[ "${FILE_STATE}" == original ]]; then
+        [[ "${context}" == "${ORIGINAL_CONTEXT}" ]] || return 1
+    else
+        [[ "${context}" == "${PATCHED_CONTEXT}" ]] || return 1
+    fi
+}
+
+check_file() {
+    if load_file "$1"; then
+        printf '%s (%s)\n' "${FILE_STATE}" "${BUILD_VERSION}"
+    else
+        printf 'unsupported\n'
+        return 1
+    fi
+}
+
+select_backup() {
+    local target="$1"
+    local generic="${target}.unpatched"
+    local versioned="${generic}-${BUILD_VERSION}"
+
+    if [[ -f "${generic}" ]] &&
+        [[ "$(hash_file "${generic}")" == "${ORIGINAL_SHA256}" ]]; then
+        backup="${generic}"
+    elif [[ -f "${versioned}" ]]; then
+        backup="${versioned}"
+    elif [[ -f "${generic}" ]]; then
+        backup="${versioned}"
+    else
+        backup="${generic}"
+    fi
+}
+
+mode="patch"
+while (($# > 0)); do
+    case "$1" in
+        --check)
+            mode="check"
+            shift
+            ;;
+        --restore)
+            mode="restore"
+            shift
+            ;;
+        --help | -h)
+            usage
+            exit
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            die "unknown option: $1"
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+(($# == 1)) || die "exactly one Vortex.exe path is required"
+target="$1"
+backup=""
+
+case "${mode}" in
+    check)
+        check_file "${target}"
+        ;;
+    restore)
+        load_file "${target}" ||
+            die "target is not a supported Vortex.exe"
+        [[ "${FILE_STATE}" == patched ]] ||
+            die "target is not the supported patched Vortex.exe"
+        select_backup "${target}"
+        [[ -f "${backup}" ]] || die "original backup is missing: ${backup}"
+        [[ "$(hash_file "${backup}")" == "${ORIGINAL_SHA256}" ]] ||
+            die "refusing an invalid original backup"
+        cp --reflink=auto -- "${backup}" "${target}.restore.$$"
+        chmod 0644 "${target}.restore.$$"
+        mv -f -- "${target}.restore.$$" "${target}"
+        printf 'Restored the original Vortex.exe v%s.\n' "${BUILD_VERSION}"
+        ;;
+    patch)
+        load_file "${target}" ||
+            die "unsupported Vortex.exe build; no bytes were changed"
+        case "${FILE_STATE}" in
+            patched)
+                printf 'Vortex.exe v%s already has the swap-chain timeout patch.\n' \
+                    "${BUILD_VERSION}"
+                exit
+                ;;
+            original)
+                ;;
+            *)
+                die "unsupported Vortex.exe build; no bytes were changed"
+                ;;
+        esac
+
+        select_backup "${target}"
+        if [[ -f "${backup}" ]]; then
+            [[ "$(hash_file "${backup}")" == "${ORIGINAL_SHA256}" ]] ||
+                die "refusing to replace an invalid original backup"
+        else
+            cp --reflink=auto -- "${target}" "${backup}"
+            chmod 0644 "${backup}"
+        fi
+
+        cp --reflink=auto -- "${target}" "${target}.patched.$$"
+        printf '\x87' |
+            dd of="${target}.patched.$$" bs=1 seek="${PATCH_OFFSET}" \
+                conv=notrunc status=none
+        chmod 0644 "${target}.patched.$$"
+        [[ "$(hash_file "${target}.patched.$$")" == "${PATCHED_SHA256}" ]] ||
+            die "patched executable did not match its expected hash"
+        [[ "$(read_context "${target}.patched.$$" "${CONTEXT_OFFSET}")" == \
+            "${PATCHED_CONTEXT}" ]] ||
+            die "patched instruction did not verify"
+        mv -f -- "${target}.patched.$$" "${target}"
+        printf 'Applied the Vortex v%s swap-chain timeout recovery patch.\n' \
+            "${BUILD_VERSION}"
+        ;;
+esac
