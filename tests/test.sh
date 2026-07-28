@@ -23,6 +23,7 @@ bash -n \
     "${REPO_DIR}/uninstall.sh" \
     "${REPO_DIR}/scripts/vortex-linux" \
     "${REPO_DIR}/scripts/proton-ge-manager" \
+    "${REPO_DIR}/scripts/download-with-progress" \
     "${REPO_DIR}/scripts/patch-vortex-exe"
 
 printf '2. Proton launch preserves the website URI as one argument\n'
@@ -219,6 +220,7 @@ ln -s GE-Proton10-99 "${fake_data}/runtimes/current"
 cat >"${fake_tools}/curl" <<'EOF'
 #!/usr/bin/env bash
 output=''
+headers=''
 url=''
 while (($# > 0)); do
     case "$1" in
@@ -226,7 +228,11 @@ while (($# > 0)); do
             output="$2"
             shift 2
             ;;
-        --proto | --proto-redir | --retry | --connect-timeout)
+        --dump-header)
+            headers="$2"
+            shift 2
+            ;;
+        --proto | --proto-redir | --retry | --connect-timeout | --range | --max-time)
             shift 2
             ;;
         --*)
@@ -240,7 +246,14 @@ while (($# > 0)); do
 done
 [[ -n "${output}" && -n "${url}" ]] || exit 2
 printf '%s\n' "${url}" >>"${VORTEX_TEST_CURL_CAPTURE}"
-cp "${VORTEX_TEST_CLIENT_ARCHIVE}" "${output}"
+archive_size="$(stat -c %s "${VORTEX_TEST_CLIENT_ARCHIVE}")"
+if [[ -n "${headers}" ]]; then
+    printf 'HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-0/%s\r\n\r\n' \
+        "${archive_size}" >"${headers}"
+fi
+if [[ "${output}" != /dev/null ]]; then
+    cp "${VORTEX_TEST_CLIENT_ARCHIVE}" "${output}"
+fi
 EOF
 cat >"${fake_tools}/file" <<'EOF'
 #!/usr/bin/env bash
@@ -276,6 +289,8 @@ PATH="${fake_tools}:${PATH}" \
 assert_line 'io.playvortex.Vortex.desktop' "${TEST_ROOT}/mime.state"
 assert_line 'https://playvortex.io/download/windows' "${curl_capture}"
 [[ -x "${fake_data}/bin/vortex-linux" ]] || fail 'installer did not copy launcher'
+[[ -x "${fake_data}/bin/download-with-progress" ]] ||
+    fail 'installer did not copy the download helper'
 cmp -s "${client_fixture}/Vortex/Vortex.exe" \
     "${fake_data}/app/Vortex.exe" ||
     fail 'installer did not extract the downloaded Vortex.exe'

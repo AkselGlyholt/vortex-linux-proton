@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+PROGRAM_NAME="download-with-progress"
+TEMP_DIR=""
+CURL_PID=""
+PROBE_PID=""
+
+die() {
+    printf '%s: %s\n' "${PROGRAM_NAME}" "$*" >&2
+    exit 1
+}
+
+cleanup() {
+    if [[ -n "${CURL_PID}" ]] && kill -0 "${CURL_PID}" 2>/dev/null; then
+        kill "${CURL_PID}" 2>/dev/null || true
+        wait "${CURL_PID}" 2>/dev/null || true
+    fi
+    if [[ -n "${PROBE_PID}" ]] && kill -0 "${PROBE_PID}" 2>/dev/null; then
+        kill "${PROBE_PID}" 2>/dev/null || true
+        wait "${PROBE_PID}" 2>/dev/null || true
+    fi
+    if [[ -n "${TEMP_DIR}" && -d "${TEMP_DIR}" ]]; then
+        rm -rf -- "${TEMP_DIR}"
+    fi
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM
+
+(($# >= 2 && $# <= 3)) ||
+    die "usage: download-with-progress URL OUTPUT [LABEL]"
+
+url="$1"
+output="$2"
+label="${3:-Downloading $(basename -- "${output}")}"
+
+command -v curl >/dev/null 2>&1 || die "required command is missing: curl"
+TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/vortex-download.XXXXXX")"
+headers="${TEMP_DIR}/headers"
+probe_headers="${TEMP_DIR}/probe-headers"
+curl_error="${TEMP_DIR}/curl-error"
+
+content_length() {
+    awk '
+        BEGIN { IGNORECASE = 1 }
+        /^content-length:/ {
+            gsub("\r", "", $2)
+            if ($2 ~ /^[0-9]+$/) {
+                content_length = $2
+            }
+        }
+        /^content-range:/ {
+            range = $0
+            sub(/^.*\//, "", range)
+            gsub("\r", "", range)
+            if (range ~ /^[0-9]+$/) {
+                range_length = range
+            }
+        }
+        END {
+            if (range_length != "") {
+                print range_length
+            } else if (content_length != "") {
+                print content_length
+            }
+        }
+    ' "$@"
+}
+
+render_progress() {
+    local download_pid="$1"
+    local start_seconds="${SECONDS}"
+    local frame=0
+    local total=0
+    local bytes=0
+    local elapsed=1
+    local percent=0
+    local filled=0
+    local empty=0
+    local downloaded_tenths=0
+    local total_tenths=0
+    local speed_tenths=0
+    local filled_bar=""
+    local empty_bar=""
+    local spinner='|/-\'
+    local spin_char=""
+    local discovered_total=""
+    local bar_width=28
+
+    while kill -0 "${download_pid}" 2>/dev/null; do
+        if [[ -f "${output}" ]]; then
+            bytes="$(stat -c %s -- "${output}" 2>/dev/null || printf '0')"
+        fi
+        if ((total == 0)); then
+            discovered_total="$(
+                content_length "${headers}" "${probe_headers}" 2>/dev/null ||
+                    true
+            )"
+            if [[ "${discovered_total}" =~ ^[0-9]+$ ]] &&
+                ((discovered_total > 0)); then
+                total="${discovered_total}"
+            fi
+        fi
+
+        elapsed=$((SECONDS - start_seconds))
+        ((elapsed > 0)) || elapsed=1
+        downloaded_tenths=$((bytes * 10 / 1048576))
+        speed_tenths=$((bytes * 10 / 1048576 / elapsed))
+        spin_char="${spinner:frame % 4:1}"
+
+        if ((total > 0)); then
+            percent=$((bytes * 100 / total))
+            ((percent <= 100)) || percent=100
+            filled=$((percent * bar_width / 100))
+            empty=$((bar_width - filled))
+            printf -v filled_bar '%*s' "${filled}" ''
+            printf -v empty_bar '%*s' "${empty}" ''
+            filled_bar="${filled_bar// /#}"
+            empty_bar="${empty_bar// /.}"
+            total_tenths=$((total * 10 / 1048576))
+            printf '\r\033[2K  [%s%s] %3d%%  %d.%d/%d.%d MiB  %d.%d MiB/s  %s' \
+                "${filled_bar}" \
+                "${empty_bar}" \
+                "${percent}" \
+                "$((downloaded_tenths / 10))" \
+                "$((downloaded_tenths % 10))" \
+                "$((total_tenths / 10))" \
+                "$((total_tenths % 10))" \
+                "$((speed_tenths / 10))" \
+                "$((speed_tenths % 10))" \
+                "${spin_char}"
+        else
+            printf '\r\033[2K  %s  %d.%d MiB downloaded  %d.%d MiB/s' \
+                "${spin_char}" \
+                "$((downloaded_tenths / 10))" \
+                "$((downloaded_tenths % 10))" \
+                "$((speed_tenths / 10))" \
+                "$((speed_tenths % 10))"
+        fi
+        frame=$((frame + 1))
+        sleep 0.2
+    done
+    printf '\r\033[2K'
+}
+
+printf '%s\n' "${label}"
+curl \
+    --fail \
+    --location \
+    --proto '=https' \
+    --proto-redir '=https' \
+    --range 0-0 \
+    --connect-timeout 10 \
+    --max-time 15 \
+    --silent \
+    --show-error \
+    --dump-header "${probe_headers}" \
+    --output /dev/null \
+    "${url}" >/dev/null 2>&1 &
+PROBE_PID=$!
+
+curl \
+    --fail \
+    --location \
+    --proto '=https' \
+    --proto-redir '=https' \
+    --retry 3 \
+    --retry-all-errors \
+    --connect-timeout 20 \
+    --silent \
+    --show-error \
+    --dump-header "${headers}" \
+    --output "${output}" \
+    "${url}" 2>"${curl_error}" &
+CURL_PID=$!
+
+if [[ -t 1 && "${TERM:-}" != dumb ]]; then
+    render_progress "${CURL_PID}"
+fi
+
+download_status=0
+wait "${CURL_PID}" || download_status=$?
+CURL_PID=""
+if [[ -n "${PROBE_PID}" ]]; then
+    wait "${PROBE_PID}" 2>/dev/null || true
+    PROBE_PID=""
+fi
+if ((download_status != 0)); then
+    [[ ! -s "${curl_error}" ]] || cat "${curl_error}" >&2
+    die "download failed with status ${download_status}"
+fi
+
+downloaded_bytes="$(stat -c %s -- "${output}")"
+downloaded_tenths=$((downloaded_bytes * 10 / 1048576))
+printf 'Download complete: %d.%d MiB.\n' \
+    "$((downloaded_tenths / 10))" \
+    "$((downloaded_tenths % 10))"

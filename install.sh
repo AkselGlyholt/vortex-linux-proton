@@ -89,25 +89,19 @@ done
 command -v file >/dev/null 2>&1 || die "required command is missing: file"
 
 if [[ -z "${EXE_SOURCE}" ]]; then
-    command -v curl >/dev/null 2>&1 || die "required command is missing: curl"
     command -v unzip >/dev/null 2>&1 || die "required command is missing: unzip"
+    [[ -x "${SOURCE_DIR}/scripts/download-with-progress" ]] ||
+        die "download helper is missing or not executable"
     TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/vortex-linux-client.XXXXXX")"
     archive="${TEMP_DIR}/Vortex-Windows.zip"
     EXE_SOURCE="${TEMP_DIR}/Vortex.exe"
 
-    printf 'Downloading the current Windows client from playvortex.io...\n'
-    curl \
-        --fail \
-        --location \
-        --proto '=https' \
-        --proto-redir '=https' \
-        --retry 3 \
-        --retry-all-errors \
-        --connect-timeout 20 \
-        --progress-bar \
-        --output "${archive}" \
-        "${CLIENT_URL}" ||
+    "${SOURCE_DIR}/scripts/download-with-progress" \
+        "${CLIENT_URL}" \
+        "${archive}" \
+        'Downloading the current Windows client from playvortex.io...' ||
         die "could not download the Windows client"
+    printf 'Extracting Vortex.exe...\n'
     unzip -Z1 "${archive}" | grep -Fxq 'Vortex/Vortex.exe' ||
         die "downloaded archive does not contain Vortex/Vortex.exe"
     unzip -p "${archive}" 'Vortex/Vortex.exe' >"${EXE_SOURCE}" ||
@@ -137,6 +131,8 @@ install -m 0644 "${EXE_SOURCE}" "${INSTALL_ROOT}/app/Vortex.exe"
 install -m 0755 "${SOURCE_DIR}/scripts/vortex-linux" "${INSTALL_ROOT}/bin/vortex-linux"
 install -m 0755 "${SOURCE_DIR}/scripts/proton-ge-manager" \
     "${INSTALL_ROOT}/bin/proton-ge-manager"
+install -m 0755 "${SOURCE_DIR}/scripts/download-with-progress" \
+    "${INSTALL_ROOT}/bin/download-with-progress"
 install -m 0755 "${SOURCE_DIR}/scripts/patch-vortex-exe" \
     "${INSTALL_ROOT}/bin/patch-vortex-exe"
 if ((PATCH_CLIENT == 1)); then

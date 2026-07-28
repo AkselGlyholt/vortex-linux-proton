@@ -4,6 +4,7 @@ set -Eeuo pipefail
 umask 077
 
 PROGRAM_NAME="vortex proton-ge manager"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 DATA_HOME="${VORTEX_DATA_HOME:-${XDG_DATA_HOME:-${HOME}/.local/share}/vortex-linux}"
 RUNTIME_ROOT="${VORTEX_RUNTIME_ROOT:-${DATA_HOME}/runtimes}"
 CURRENT_LINK="${RUNTIME_ROOT}/current"
@@ -134,11 +135,10 @@ install_latest() {
     DOWNLOAD_TMP_DIR="${tmp_dir}"
     trap cleanup_download EXIT
 
-    printf 'Downloading %s...\n' "${tarball_name}"
-    curl --fail --show-error --location \
-        --retry 3 --retry-delay 2 \
-        --output "${tmp_dir}/${tarball_name}" \
-        "${tarball_url}"
+    "${SCRIPT_DIR}/download-with-progress" \
+        "${tarball_url}" \
+        "${tmp_dir}/${tarball_name}" \
+        "Downloading ${tarball_name}..."
     curl --fail --silent --show-error --location \
         --retry 3 --retry-delay 2 \
         --output "${tmp_dir}/${checksum_name}" \
